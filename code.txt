@@ -1,0 +1,280 @@
+是的，DQN 模型可以独立保存和读取，Replay Buffer 只是在训练过程中用于存储和采样经验。以下是更新的代码，不再保存和读取 Replay Buffer，而是仅保存和读取 DQN 模型。
+
+### 数据预处理和生成器
+
+```python
+import pandas as pd
+import numpy as np
+import torch
+from sklearn.preprocessing import MinMaxScaler
+from torch.utils.data import Dataset, DataLoader
+
+class HSIDataset(Dataset):
+    def __init__(self, file_path, seq_length, block_size=600, predict_size=150):
+        data = pd.read_csv(file_path, nrows=5000)  # 只读取前5000行数据
+        filtered_data = data[data['status'] == 'T']
+        selected_columns = ['current', 'turnover', 'high', 'low', 'change', 'percent']
+        self.filtered_data = filtered_data[selected_columns]
+        self.scaler = MinMaxScaler()
+        self.normalized_data = self.scaler.fit_transform(self.filtered_data).astype(np.float32)
+        self.seq_length = seq_length
+        self.block_size = block_size
+        self.predict_size = predict_size
+
+    def __len__(self):
+        return (len(self.normalized_data) // self.block_size) * (self.block_size - self.predict_size - self.seq_length + 1)
+
+    def __getitem__(self, idx):
+        block_start = (idx // (self.block_size - self.predict_size - self.seq_length + 1)) * self.block_size
+        within_block_idx = idx % (self.block_size - self.predict_size - self.seq_length + 1)
+        x_start = block_start + within_block_idx
+        x = self.normalized_data[x_start:x_start + self.seq_length]
+        y = self.normalized_data[x_start + self.seq_length:x_start + self.seq_length + self.predict_size]  # 预测后150个数据点
+        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
+
+file_path = 'hsi_data.csv'
+seq_length = 32  # LSTM步长
+dataset = HSIDataset(file_path, seq_length)
+dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+means, stds = dataset.filtered_data.mean(), dataset.filtered_data.std()
+scaler = dataset.scaler
+
+# 保存归一化后的数据
+np.save('normalized_data.npy', dataset.normalized_data)
+np.save('means.npy', means)
+np.save('stds.npy', stds)
+
+# 加载归一化后的数据
+normalized_data = np.load('normalized_data.npy')
+means = np.load('means.npy')
+stds = np.load('stds.npy')
+```
+
+### 加载或训练 LSTM 模型
+
+```python
+import torch.nn as nn
+import torch.optim as optim
+import os
+
+class LSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super(LSTMModel, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        h_0 = torch.zeros(1, x.size(0), 50)
+        c_0 = torch.zeros(1, x.size(0), 50)
+        out, _ = self.lstm(x, (h_0, c_0))
+        out = self.fc(out[:, -1, :])
+        return out
+
+input_shape = dataset.filtered_data.shape[1]
+lstm_model = LSTMModel(input_shape, 50, input_shape)
+model_path = 'lstm_model.pth'
+
+if os.path.exists(model_path):
+    lstm_model.load_state_dict(torch.load(model_path))
+    lstm_model.eval()
+    print("Loaded LSTM model from disk.")
+else:
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(lstm_model.parameters(), lr=0.001)
+
+    # 训练 LSTM 模型
+    for epoch in range(10):
+        epoch_loss = 0.0
+        for X_batch, y_batch in dataloader:
+            optimizer.zero_grad()
+            output = lstm_model(X_batch)
+            loss = criterion(output, y_batch[:, -1, :])
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+        print(f"Epoch {epoch+1}, Loss: {epoch_loss / len(dataloader)}")
+
+    torch.save(lstm_model.state_dict(), model_path)
+    print("Trained and saved new LSTM model.")
+```
+
+### 自定义环境和 DQN 训练
+
+```python
+import os
+import tensorflow as tf
+from tf_agents.environments import py_environment, tf_py_environment
+from tf_agents.specs import array_spec
+from tf_agents.trajectories import time_step as ts
+from tf_agents.agents.dqn import dqn_agent
+from tf_agents.networks import q_network
+from tf_agents.replay_buffers import tf_uniform_replay_buffer
+from tf_agents.utils import common
+from tf_agents.policies import random_tf_policy
+
+class HSIEnv(py_environment.PyEnvironment):
+    def __init__(self, data):
+        self.data = data.astype(np.float32)
+        self._action_spec = array_spec.BoundedArraySpec(
+            shape=(), dtype=np.int32, minimum=0, maximum=1, name='action'
+        )
+        self._observation_spec = array_spec.BoundedArraySpec(
+            shape=data.shape[1:], dtype=np.float32, minimum=0, maximum=1, name='observation'
+        )
+        self._state = None
+        self._episode_ended = False
+        self.reset()
+
+    def action_spec(self):
+        return self._action_spec
+
+    def observation_spec(self):
+        return self._observation_spec
+
+    def _reset(self):
+        self._state = self.data[0]
+        self._current_step = 0
+        self._units = 100
+        self._balance = 0
+        self._episode_ended = False
+        return ts.restart(self._state)
+
+    def _step(self, action):
+        if self._episode_ended:
+            return self.reset()
+
+        reward = 0
+        if action == 1 and self._units > 0:
+            reward = self.data[self._current_step, 3] * self._units
+            self._balance += reward
+            self._units = 0
+
+        self._current_step += 1
+        if self._current_step >= len(self.data) - 1:
+            self._episode_ended = True
+
+        if self._episode_ended:
+            return ts.termination(self._state, reward)
+        else:
+            self._state = self.data[self._current_step]
+            return ts.transition(self._state, reward)
+
+normalized_data = np.load('normalized_data.npy')
+
+env = tf_py_environment.TFPyEnvironment(HSIEnv(normalized_data))
+
+q_net = q_network.QNetwork(env.observation_spec(), env.action_spec())
+optimizer = tf.keras.optimizers.Adam(learning_rate=1e-3)
+train_step_counter = tf.Variable(0)
+agent = dqn_agent.DqnAgent(
+    env.time_step_spec(), env.action_spec(), q_network=q_net,
+    optimizer=optimizer, td_errors_loss_fn=common.element_wise_squared_loss,
+    train_step_counter=train_step_counter
+)
+agent.initialize()
+
+# 设置 Replay Buffer 的最大长度和初始采集步骤
+max_length = 100000
+initial_collect_steps = 5000
+
+# 创建 Replay Buffer
+replay_buffer = tf_uniform_replay_buffer.TFUniformReplayBuffer(
+    data_spec=agent.collect_data_spec, batch_size=env.batch_size, max_length=max_length
+)
+
+# 初始采集经验
+random_policy = random_tf_policy.RandomTFPolicy(env.time_step_spec(), env.action_spec())
+for _ in range(initial_collect_steps):
+    time_step = env.reset()
+    while not time_step.is_last():
+        action_step = random_policy.action(time_step)
+        next_time_step = env.step(action_step.action)
+        traj = tf_agents.trajectories.from_transition(time_step, action_step, next_time_step)
+        replay_buffer.add_batch(traj)
+        time_step = next_time_step
+
+# 创建数据集
+dataset = replay_buffer.as_dataset(
+    sample_batch_size=64, 
+    num_steps=2, 
+    single_deterministic_pass=False
+).prefetch(3)
+
+iterator = iter(dataset)
+num_iterations = 20000
+
+for _ in range(num_iterations):
+    experience, _ = next(iterator)
+    print(f"Experience step_type shape: {experience.step_type.shape}")
+    print(f"Experience observation shape: {experience.observation.shape}")
+    print(f"Experience action shape: {experience.action.shape}")
+    train_loss = agent.train(experience).loss
+    print(f"Training loss: {train_loss}")
+
+# 保存DQN模型和策略
+agent.policy.save('dqn_policy')
+print('Training completed')
+```
+
+### 实时预测和决策
+
+```python
+import numpy as np
+import torch
+
+def simulate_trading(env, agent, lstm_model, scaler, seq_length, normalized_data):
+    time_step = env.reset()
+    total_reward = 0
+    actions = []
+    units_left = 100
+
+    while not time_step.is_last() and units_left > 0:
+        state_reshaped = torch.tensor(time_step.observation.numpy().reshape(1, time_step.observation.shape[0]), dtype=torch.float32)
+        state_reshaped = state_reshaped.unsqueeze(0).expand(seq_length, -1).unsqueeze(0)  # 填充数据以满足LSTM的输入要求
+        features = lstm_model(state
+
+_reshaped).detach().numpy()
+
+        action_step = agent.policy.action(tf.convert_to_tensor(features, dtype=tf.float32))
+        action = action_step.numpy()
+       
+        next_time_step = env.step(action)
+
+        if action == 1 and units_left > 0:
+            sell_units = min(units_left, 100)
+            total_reward += next_time_step.reward.numpy() * sell_units / 100
+            units_left -= sell_units
+
+        actions.append((env._current_step, action, next_time_step.reward.numpy(), units_left))
+        time_step = next_time_step
+
+    return actions, total_reward
+
+def generate_mock_data_point(means, stds):
+    return np.random.normal(means, stds).reshape(1, -1).astype(np.float32)
+
+mock_data_point = generate_mock_data_point(means, stds)
+mock_data_point_scaled = scaler.transform(mock_data_point)
+
+# 确保 data 有足够的长度
+if len(normalized_data) < seq_length:
+    raise ValueError(f"Normalized data is too short. Expected at least {seq_length} data points, got {len(normalized_data)}.")
+
+# 获取最近的 seq_length 个数据点，并拼接 mock 数据点
+recent_data = normalized_data[-seq_length+1:]  # 取最近的 seq_length-1 个数据点
+data = np.vstack((recent_data, mock_data_point_scaled))
+print(f"data shape before reshape: {data.shape}")
+
+# 确保 data 的大小符合预期
+if data.shape[0] == seq_length and data.shape[1] == normalized_data.shape[1]:
+    new_features = lstm_model(torch.tensor(data.reshape(1, seq_length, data.shape[1]), dtype=torch.float32)).detach().numpy()
+    actions, total_reward = simulate_trading(env, agent, lstm_model, scaler, seq_length, normalized_data)
+    print("Actions:", actions)
+    print("Total Reward:", total_reward)
+else:
+    print("Data shape is not compatible for reshaping.")
+```
+
+### 总结
+
+这个更新后的代码移除了 Replay Buffer 的保存和读取，只保留了 DQN 模型的保存和读取。在实时预测和决策部分，增加了对 `state_reshaped` 的调整，以确保其形状符合 LSTM 模型的输入要求。通过这种方式，可以节省存储空间，同时保留 DQN 模型的训练结果。
